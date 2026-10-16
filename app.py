@@ -1549,7 +1549,8 @@ def render_team_builder(df, player_labels, player_options):
             "estimates on lineups it did not learn from.\n"
             "- It looks at each player's skills and how those skills may fit "
             "together.\n"
-            "- Lineups with more playing time provide stronger evidence.\n"
+            "- Lineups with at least 10 minutes count. Longer samples carry "
+            "more weight, and short-sample results are pulled toward average.\n"
             "- Estimates are less certain for combinations unlike the ones "
             "in the data.\n"
             "- The data cannot capture everything, such as coaching, "
@@ -4161,7 +4162,7 @@ LINEUP_TARGET_COLUMNS = {
     "Defense (points prevented per 100)": ("DefC", -1),
 }
 
-LINEUP_MODEL_MIN_MINUTES = 40     # lineups below this are too noisy to train on
+LINEUP_MODEL_MIN_MINUTES = 10     # include short samples, but skip the noisiest
 LINEUP_WEIGHT_CAP = 800           # no single lineup counts for more than this
 LINEUP_SHRINK_MINUTES = 800       # Lineup Lab's historical display shrinkage
 LINEUP_TARGET_PRIOR_MINUTES = 200 # Team Builder target reliability prior
@@ -5879,7 +5880,6 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
-
 
 
 

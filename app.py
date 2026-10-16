@@ -1,4 +1,5 @@
 import html
+import math
 import re
 import zlib
 
@@ -20,6 +21,8 @@ st.set_page_config(
 
 DATA_FILE = Path(__file__).parent / "player_seasons.csv.gz"
 NAME_FILE = Path(__file__).parent / "player_team_seasons.csv"
+TRIO_FILE = Path(__file__).parent / "3man_subunits_all_seasons.csv.gz"
+QUARTET_FILE = Path(__file__).parent / "4man_subunits_all_seasons.csv.gz"
 
 # --------------------------------------------------
 # CUSTOM DESIGN
@@ -904,9 +907,9 @@ def _fit_builder_pair_axes(z, feature_cols, n_axes=BUILDER_PAIR_AXES):
 
 
 def _builder_pair_interactions(projected):
-    """Sum symmetric skill-fit products over the ten player pairs.
+    """Average symmetric skill-fit products over every distinct player pair.
 
-    `projected` has shape (lineups, 5, skill_axes). Unlike products of a
+    `projected` has shape (groups, players, skill_axes). Unlike products of a
     lineup average, these features only multiply skills across two different
     players, so they directly represent pair fit.
     """
@@ -927,6 +930,62 @@ def _builder_pair_interactions(projected):
     if pair_count:
         output /= pair_count
     return output
+
+
+def _builder_group_interactions(projected):
+    """Return learned cross-player terms for groups of sizes two through five.
+
+    Pair features retain the existing eight-axis compatibility geometry.
+    Three-, four-, and five-player terms use the first three axes and the
+    coefficients of the symmetric polynomial product across distinct players.
+    A k-player term is therefore zero for groups smaller than k.
+    """
+    from itertools import product
+
+    projected = np.asarray(projected, dtype=np.float32)
+    n_rows, n_players, n_axes = projected.shape
+    pair = _builder_pair_interactions(projected)
+    rank = min(3, n_axes)
+    max_order = 5
+    if rank == 0:
+        return pair
+    if n_players < 3:
+        return np.concatenate(
+            [pair, np.zeros((n_rows, 46), dtype=np.float32)], axis=1
+        )
+
+    exponents = [
+        exp for exp in product(range(max_order + 1), repeat=rank)
+        if 3 <= sum(exp) <= max_order
+    ]
+    exponents.sort(key=lambda exp: (sum(exp), exp))
+    # Elementary symmetric products: every term selects distinct players.
+    # Retain the constant polynomial internally so each new player updates
+    # the product without ever multiplying a player's own skills together.
+    state = {(0,) * rank: np.ones(n_rows, dtype=np.float32)}
+    for player in range(n_players):
+        updated = dict(state)
+        for exp, values in state.items():
+            if sum(exp) >= max_order:
+                continue
+            for axis in range(rank):
+                next_exp = list(exp)
+                next_exp[axis] += 1
+                next_exp = tuple(next_exp)
+                if sum(next_exp) > max_order:
+                    continue
+                term = values * projected[:, player, axis]
+                if next_exp in updated:
+                    updated[next_exp] = updated[next_exp] + term
+                else:
+                    updated[next_exp] = term
+        state = updated
+    values = np.zeros((n_rows, len(exponents)), dtype=np.float32)
+    for column, exp in enumerate(exponents):
+        if exp in state:
+            degree = sum(exp)
+            values[:, column] = state[exp] / max(1, math.comb(n_players, degree))
+    return np.concatenate([pair, values], axis=1)
 
 
 def _builder_pair_columns(axis_labels):
@@ -1053,11 +1112,26 @@ def builder_tables(data):
     # five-man outcomes in Team Builder.
     pair_axes, pair_axis_labels = _fit_builder_pair_axes(z, list(z.columns))
     pair_cols = _builder_pair_columns(pair_axis_labels)
+    order_axis_labels = pair_axis_labels[:min(3, len(pair_axis_labels))]
+    from itertools import product
+    order_exponents = [
+        exp for exp in product(range(6), repeat=len(order_axis_labels))
+        if 3 <= sum(exp) <= 5
+    ]
+    order_exponents.sort(key=lambda exp: (sum(exp), exp))
+    order_cols = [
+        "Player-group fit: " + " × ".join(
+            label for label, count in zip(order_axis_labels, exp)
+            for _ in range(count)
+        )
+        for exp in order_exponents
+    ]
+    pair_cols = pair_cols + order_cols
     if pair_cols:
         projected = z[list(z.columns)].to_numpy(dtype=np.float32) @ pair_axes
         profile_keys = list(zip(profile["Season"], profile["Tm"]))
         core_rows = np.asarray([cores[key] for key in profile_keys], dtype=int)
-        profile_pair_values = _builder_pair_interactions(projected[core_rows])
+        profile_pair_values = _builder_group_interactions(projected[core_rows])
         for i, column in enumerate(pair_cols):
             profile[column] = profile_pair_values[:, i]
 
@@ -1136,15 +1210,24 @@ def _design(features, interactions):
 
 
 def _builder_design(features, interactions, interaction_cols=(),
-                    interaction_values=None, interaction_frame=None):
+                    interaction_values=None, interaction_frame=None,
+                    compact=False):
     """Build the compact Team Builder design matrix.
 
-    Keep the broad quadratic interactions among lineup summaries, and append
-    explicit player-pair skill features when available.
+    Keep the broad quadratic interactions among lineup summaries unless the
+    memory-conscious expanded subunit path requests a compact design. Append
+    explicit player-group skill features when available.
     """
     if not interactions or not interaction_cols:
         return _design(features, interactions)
-    design = _design(features, True)
+    if compact:
+        # Expanded subunit training can exceed a million rows. Keep the
+        # profile basis linear and let explicit cross-player terms carry the
+        # interaction signal instead of materializing every quadratic pair
+        # among all profile columns.
+        design = features.copy()
+    else:
+        design = _design(features, True)
     if interaction_frame is not None:
         extra = interaction_frame.loc[:, list(interaction_cols)].reset_index(drop=True)
     else:
@@ -1284,7 +1367,8 @@ def _fit_variant_blocked(X, y, w, season_index, season_fold, k, alphas):
 
 @st.cache_resource(show_spinner="Fitting the model across seasons...")
 def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
-                       carry_cols=(), interaction_cols=(), cache_key=()):
+                       carry_cols=(), interaction_cols=(), cache_key=(),
+                       eval_mask_col=None, compact_design=False):
     """Fit additive and interaction models, scored on held-out groups.
 
     Seasons are split into folds, and each fold is predicted by a model
@@ -1296,9 +1380,14 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
     """
     data = _profiles.dropna(subset=[target_col]).reset_index(drop=True)
     y = data[target_col].to_numpy(float)
+    eval_mask = (data[eval_mask_col].fillna(False).to_numpy(bool)
+                 if eval_mask_col and eval_mask_col in data.columns
+                 else np.ones(len(data), dtype=bool))
+    if not eval_mask.any():
+        raise ValueError("The model has no five-player evaluation rows.")
     interaction_support = None
     if interaction_cols:
-        pair_values = data[list(interaction_cols)].to_numpy(dtype=float)
+        pair_values = data.loc[eval_mask, list(interaction_cols)].to_numpy(dtype=float)
         interaction_support = {
             "lo": np.percentile(pair_values, 1, axis=0),
             "hi": np.percentile(pair_values, 99, axis=0),
@@ -1338,7 +1427,7 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
     total_ss = float((w_all * (y - y_bar) ** 2).sum())
     alphas = (
         BUILDER_ALPHAS if weights is None
-        else [a * len(y) / 500.0 for a in BUILDER_ALPHAS]
+        else [a * float(w_all[eval_mask].sum()) / 500.0 for a in BUILDER_ALPHAS]
     )
 
     def subset(array, index):
@@ -1349,6 +1438,7 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
         design = _builder_design(
             data[feature_cols], interactions, interaction_cols,
             interaction_frame=data if interactions and interaction_cols else None,
+            compact=compact_design,
         )
         X = design.to_numpy(dtype=np.float32, copy=False)
 
@@ -1361,10 +1451,14 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
             for alpha in alphas:
                 oof = np.zeros(len(y))
                 for fold in range(k):
-                    train, test = folds != fold, folds == fold
+                    test = (folds == fold) & eval_mask
+                    train = (folds != fold) | ~eval_mask
+                    if not test.any():
+                        continue
                     model = _ridge_fit(X[train], y[train], alpha, subset(weights, train))
                     oof[test] = _ridge_predict(model, X[test])
-                sse = float((w_all * (y - oof) ** 2).sum())
+                sse = float((w_all[eval_mask]
+                             * (y[eval_mask] - oof[eval_mask]) ** 2).sum())
                 if best is None or sse < best[0]:
                     best = (sse, alpha, oof)
 
@@ -1408,14 +1502,16 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
         n_future = max(1, int(np.ceil(len(unique_seasons) * 0.2)))
         if len(unique_seasons) >= 4:
             future_seasons = set(unique_seasons[-n_future:])
-            future_test = np.isin(seasons, list(future_seasons))
-            future_train = ~future_test
+            in_future_seasons = np.isin(seasons, list(future_seasons))
+            future_test = in_future_seasons & eval_mask
+            future_train = ~in_future_seasons
             if "LineupKey" in data.columns and future_test.any():
                 held_groups = set(groups[future_test])
                 future_train &= ~np.isin(groups, list(held_groups))
             train_seasons = set(seasons[future_train])
             if future_test.any() and len(train_seasons) >= 2 and future_train.sum() >= 100:
                 train_groups = groups[future_train]
+                train_eval = eval_mask[future_train]
                 inner_groups = sorted(set(train_groups))
                 inner_k = min(3, len(inner_groups))
                 inner_fold_of = {g: i % inner_k for i, g in enumerate(inner_groups)}
@@ -1427,8 +1523,8 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
                 for candidate_alpha in alphas:
                     inner_sse = 0.0
                     for inner_fold in range(inner_k):
-                        fit_local = inner_folds != inner_fold
-                        val_local = inner_folds == inner_fold
+                        val_local = (inner_folds == inner_fold) & train_eval
+                        fit_local = (inner_folds != inner_fold) | ~train_eval
                         if not fit_local.any() or not val_local.any():
                             continue
                         inner_model = _ridge_fit(
@@ -1453,9 +1549,10 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
                 )
                 future_pred = _ridge_predict(future_model, X[future_test])
                 future_weights = w_all[future_test]
+                future_train_eval = future_train & eval_mask
                 future_mean = float(
-                    (w_all[future_train] * y[future_train]).sum()
-                    / w_all[future_train].sum()
+                    (w_all[future_train_eval] * y[future_train_eval]).sum()
+                    / w_all[future_train_eval].sum()
                 )
                 future_ss = float(
                     (future_weights * (y[future_test] - future_mean) ** 2).sum()
@@ -1470,13 +1567,19 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
                     "n": int(future_test.sum()),
                 }
 
+        eval_y = y[eval_mask]
+        eval_w = w_all[eval_mask]
+        eval_oof = oof[eval_mask]
+        eval_mean = float((eval_w * eval_y).sum() / eval_w.sum())
+        eval_ss = float((eval_w * (eval_y - eval_mean) ** 2).sum())
+        eval_sse = float((eval_w * (eval_y - eval_oof) ** 2).sum())
         results[name] = {
             "boot": boot,
             "alpha": alpha,
-            "r2": 1 - sse / total_ss,
-            "rmse": float(np.sqrt(sse / w_all.sum())),
-            "oof": oof,
-            "fitted": _ridge_predict(model, X),
+            "r2": 1 - eval_sse / eval_ss if eval_ss > 0 else np.nan,
+            "rmse": float(np.sqrt(eval_sse / eval_w.sum())),
+            "oof": eval_oof,
+            "fitted": _ridge_predict(model, X[eval_mask]),
             "model": model,
             "columns": list(design.columns),
             "future": future_eval,
@@ -1484,18 +1587,20 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
         del design, X
 
     # What do real historical groups look like? Used by the guardrails.
-    F = data[feature_cols].to_numpy(float)
-    if weights is None:
+    eval_data = data.loc[eval_mask].reset_index(drop=True)
+    F = eval_data[feature_cols].to_numpy(float)
+    eval_weights = weights[eval_mask] if weights is not None else None
+    if eval_weights is None:
         center = F.mean(axis=0)
         cov = np.cov(F, rowvar=False) + 1e-6 * np.eye(F.shape[1])
         lo, hi = np.percentile(F, 1, axis=0), np.percentile(F, 99, axis=0)
     else:
-        center = (weights[:, None] * F).sum(axis=0) / weights.sum()
+        center = (eval_weights[:, None] * F).sum(axis=0) / eval_weights.sum()
         centered_w = F - center
-        cov = (weights[:, None] * centered_w).T @ centered_w / weights.sum()
+        cov = (eval_weights[:, None] * centered_w).T @ centered_w / eval_weights.sum()
         cov = cov + 1e-6 * np.eye(F.shape[1])
-        lo = np.array([_weighted_percentile(F[:, j], weights, 1) for j in range(F.shape[1])])
-        hi = np.array([_weighted_percentile(F[:, j], weights, 99) for j in range(F.shape[1])])
+        lo = np.array([_weighted_percentile(F[:, j], eval_weights, 1) for j in range(F.shape[1])])
+        hi = np.array([_weighted_percentile(F[:, j], eval_weights, 99) for j in range(F.shape[1])])
     inverse = np.linalg.inv(cov)
     centered = F - center
     results["support"] = {
@@ -1504,28 +1609,291 @@ def fit_builder_models(_profiles, feature_cols, target_col, weight_col=None,
         "d2": np.einsum("ij,jk,ik->i", centered, inverse, centered),
         "lo": lo,
         "hi": hi,
-        "w": weights,
+        "w": eval_weights,
     }
 
     # Best and worst real results to compare against (ignoring tiny samples).
-    reference_rows = np.ones(len(y), dtype=bool)
-    if "Minutes" in data.columns:
-        big = data["Minutes"].to_numpy(float) >= 200
+    reference_rows = np.ones(int(eval_mask.sum()), dtype=bool)
+    if "Minutes" in eval_data.columns:
+        big = eval_data["Minutes"].to_numpy(float) >= 200
         if big.sum() >= 30:
             reference_rows = big
     results["reference"] = (
-        float(y[reference_rows].max()), float(y[reference_rows].min())
+        float(eval_data.loc[reference_rows, target_col].max()),
+        float(eval_data.loc[reference_rows, target_col].min())
     )
 
     keep = ["Season", "Tm", "Era", "Core five"] + [
         c for c in carry_cols if c in data.columns
     ]
-    results["data"] = data[keep].assign(actual=y)
+    results["data"] = eval_data[keep].assign(actual=eval_data[target_col].to_numpy(float))
     if weight_col is not None:
-        results["data"]["weight"] = data[weight_col].to_numpy(float)
+        results["data"]["weight"] = eval_data[weight_col].to_numpy(float)
     results["interaction_cols"] = list(interaction_cols)
     results["interaction_support"] = interaction_support
+    results["compact_design"] = bool(compact_design)
     return results
+
+
+def _rotation_lineup_weights(minutes, game_minutes=48.0, lineup_size=5):
+    """Build a maximum-entropy mix of five-player groups matching minutes.
+
+    This picks a neutral rotation for the requested player-minute totals. It
+    does not give extra time to lineups merely because the prediction likes
+    them.
+    """
+    from itertools import combinations
+
+    minutes = np.asarray(minutes, dtype=float)
+    targets = minutes / game_minutes
+    forced = np.flatnonzero(targets >= 1.0 - 1e-9)
+    excluded = np.flatnonzero(targets <= 1e-9)
+    optional = np.array(
+        [i for i in range(len(minutes)) if i not in set(forced) | set(excluded)],
+        dtype=int,
+    )
+    needed = lineup_size - len(forced)
+    if needed < 0 or needed > len(optional):
+        raise ValueError("Those minutes cannot form a five-player rotation.")
+
+    optional_groups = list(combinations(range(len(optional)), needed))
+    mask = np.zeros((len(optional_groups), len(optional)), dtype=float)
+    for row, group in enumerate(optional_groups):
+        if group:
+            mask[row, list(group)] = 1.0
+    desired = targets[optional]
+    if not np.isclose(desired.sum(), needed, atol=1e-7):
+        raise ValueError("Player minutes must add up to 240 for a 48-minute game.")
+
+    theta = np.zeros(len(optional), dtype=float)
+
+    def distribution(values):
+        if mask.shape[1] == 0:
+            return np.ones(len(mask)), np.zeros(0)
+        logits = mask @ values
+        logits -= logits.max()
+        prob = np.exp(logits)
+        prob /= prob.sum()
+        return prob, prob @ mask
+
+    for _ in range(100):
+        probabilities, means = distribution(theta)
+        residual = means - desired
+        if not len(residual) or np.max(np.abs(residual)) < 1e-8:
+            break
+        centered = mask - means
+        covariance = centered.T @ (centered * probabilities[:, None])
+        step = np.linalg.pinv(covariance, rcond=1e-10) @ residual
+        old_error = float(np.linalg.norm(residual))
+        accepted = False
+        for scale in (1.0, 0.5, 0.25, 0.1, 0.05, 0.01):
+            candidate = theta - scale * step
+            candidate -= candidate.mean()
+            candidate_prob, candidate_means = distribution(candidate)
+            if np.linalg.norm(candidate_means - desired) < old_error:
+                theta = candidate
+                accepted = True
+                break
+        if not accepted:
+            break
+
+    probabilities, means = distribution(theta)
+    if len(means) and np.max(np.abs(means - desired)) > 1e-5:
+        raise ValueError(
+            "I couldn't match that rotation exactly. Try moving a few minutes "
+            "between players and keep the total at 240."
+        )
+
+    lineups = []
+    for group in optional_groups:
+        chosen = list(forced) + [int(optional[i]) for i in group]
+        lineups.append(tuple(sorted(chosen)))
+    return lineups, probabilities
+
+
+def render_12_player_team_builder(
+    df, player_labels, player_options, zfeat, pools, base_cols,
+    feature_cols, chosen_key, chosen, results, target_label, support,
+    strict, limit_pools, calib_scale, basis_scale, use_pair_layer,
+    pair_layer, blend_history,
+):
+    """Build a 12-player roster and evaluate its minute-matched rotation."""
+    st.markdown("#### Choose 12 players and their seasons")
+    st.caption(
+        "Use one season for each player. Set each player's minutes below; "
+        "the total must be 240 for a regulation game."
+    )
+
+    minutes_by_row = _minutes(df)
+    selected_rows, selected_ids, selected_names = [], [], []
+    for block in range(3):
+        slots = st.columns(4)
+        for offset, slot in enumerate(slots):
+            i = block * 4 + offset
+            with slot:
+                label = st.selectbox(
+                    f"Player {i + 1}", ["— choose —"] + player_labels,
+                    key=f"team12_player_{i}",
+                )
+                if label == "— choose —":
+                    selected_rows.append(None)
+                    selected_ids.append(None)
+                    selected_names.append(None)
+                    continue
+                player_id = str(player_options[label])
+                rows = df[df["player_id"].astype(str) == player_id].sort_values("Season")
+                season_rows = {}
+                for row_index, row in rows.iterrows():
+                    team = f" ({row['Tm']})" if "Tm" in rows.columns else ""
+                    season_rows[f"{row['Season']}{team}"] = row_index
+                season_labels = list(season_rows)
+                default_index = 0
+                if minutes_by_row is not None and len(rows):
+                    best_index = minutes_by_row.loc[rows.index].idxmax()
+                    default_index = next(
+                        (j for j, name in enumerate(season_labels)
+                         if season_rows[name] == best_index), 0
+                    )
+                season = st.selectbox(
+                    "Season", season_labels, index=default_index,
+                    key=f"team12_season_{i}_{player_id}",
+                )
+                selected_rows.append(season_rows[season])
+                selected_ids.append(player_id)
+                selected_names.append(str(rows.loc[season_rows[season], "player_name"]))
+
+    if any(row is None for row in selected_rows):
+        st.info("Choose all 12 players to set the rotation.")
+        return
+    if len(set(selected_ids)) != 12:
+        st.warning("Choose 12 different players. A player can only occupy one roster spot.")
+        return
+
+    st.markdown("#### Allocate player minutes")
+    st.caption(
+        "A regulation game has 240 player-minutes: 48 minutes × 5 players. "
+        "The app will find a balanced mix of five-player groups that matches "
+        "your allocations."
+    )
+    roster_minutes = []
+    for block in range(3):
+        slots = st.columns(4)
+        for offset, slot in enumerate(slots):
+            i = block * 4 + offset
+            with slot:
+                roster_minutes.append(st.slider(
+                    f"{selected_names[i]} minutes",
+                    min_value=0, max_value=48, value=20, step=1,
+                    key=f"team12_minutes_{i}",
+                ))
+
+    total_minutes = int(sum(roster_minutes))
+    st.metric("Rotation minutes", f"{total_minutes} / 240")
+    if total_minutes != 240:
+        st.info(f"Adjust the allocation by {240 - total_minutes:+d} minutes to continue.")
+        return
+
+    try:
+        lineup_indices, lineup_probabilities = _rotation_lineup_weights(roster_minutes)
+    except ValueError as error:
+        st.warning(str(error))
+        return
+
+    st.write("Calculating predictions for the possible five-player groups…")
+    best_seen, worst_seen = results["reference"]
+    predicted, lineup_labels = [], []
+    lineup_minutes = []
+
+    for group, probability in zip(lineup_indices, lineup_probabilities):
+        rows = [selected_rows[i] for i in group]
+        if limit_pools:
+            lineup_z, _ = apply_pool_limits(df, zfeat, pools, rows, base_cols)
+        else:
+            lineup_z = zfeat.loc[rows, base_cols]
+        lineup = pd.concat([lineup_z.mean(axis=0), role_values(lineup_z)])
+        vector = lineup.reindex(feature_cols).fillna(0).to_numpy(float)
+        interaction_cols = results.get("interaction_cols", [])
+        pair_values = np.zeros(len(interaction_cols), dtype=np.float32)
+        interaction_axes = pools.get("interaction_axes")
+        if interaction_cols and interaction_axes is not None and interaction_axes.shape[1]:
+            player_axes = lineup_z[base_cols].to_numpy(dtype=np.float32) @ interaction_axes
+            pair_values = _builder_group_interactions(player_axes[None, :, :])[0]
+            if strict and results.get("interaction_support") is not None:
+                pair_support = results["interaction_support"]
+                pair_values = np.clip(pair_values, pair_support["lo"], pair_support["hi"])
+
+        model_vector = np.clip(vector, support["lo"], support["hi"]) if strict else vector
+        design = _builder_design(
+            pd.DataFrame([model_vector], columns=feature_cols),
+            chosen_key == "interact", interaction_cols,
+            interaction_values=pair_values,
+            compact=results.get("compact_design", False),
+        )
+        X = design[chosen["columns"]].to_numpy(float)
+        estimate = float(_ridge_predict(chosen["model"], X)[0])
+        if strict:
+            centered = vector - support["mu"]
+            distance = float(centered @ support["inv"] @ centered)
+            history_limit = float(support["d2"].max())
+            trust = min(1.0, float(np.sqrt(history_limit / distance))) if distance > history_limit else 1.0
+            estimate *= trust
+        estimate *= calib_scale
+        if strict:
+            estimate = float(np.clip(estimate, worst_seen, best_seen))
+
+        if use_pair_layer and pair_layer:
+            chemistry = lineup_pair_synergy(
+                df, zfeat, pair_layer, rows, base_cols,
+                use_history=blend_history,
+            )
+            estimate += pair_layer["backtest"]["lam"] * float(chemistry["Used"].sum())
+
+        predicted.append(estimate * basis_scale)
+        lineup_minutes.append(float(probability * 48.0))
+        lineup_labels.append(" · ".join(selected_names[i] for i in group))
+
+    predicted = np.asarray(predicted, dtype=float)
+    lineup_minutes = np.asarray(lineup_minutes, dtype=float)
+    average = float(np.average(predicted, weights=lineup_minutes))
+    error = float(chosen["rmse"] * basis_scale * max(1.0, calib_scale))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"Predicted team {target_label.split(' (')[0].lower()}", f"{average:+.1f} per 100")
+    c2.metric("Approx. 80% model range", f"{average - 1.28 * error:+.1f} to {average + 1.28 * error:+.1f}")
+    c3.metric("Five-player groups in rotation", f"{len(lineup_indices):,}")
+    st.caption(
+        "This is a minute-weighted estimate across the rotation. The app "
+        "uses a balanced mix of groups that matches your minutes, instead "
+        "of assuming only the highest-rated groups will play."
+    )
+
+    actual_by_player = np.zeros(12, dtype=float)
+    for group, minutes in zip(lineup_indices, lineup_minutes):
+        actual_by_player[list(group)] += minutes
+    minute_table = pd.DataFrame({
+        "Player": selected_names,
+        "Season": [str(df.loc[row, "Season"]) for row in selected_rows],
+        "Assigned minutes": roster_minutes,
+        "Rotation minutes": actual_by_player,
+    })
+    st.dataframe(
+        minute_table.style.format({
+            "Assigned minutes": "{:.0f}", "Rotation minutes": "{:.1f}"
+        }), use_container_width=True, hide_index=True,
+    )
+
+    rotation = pd.DataFrame({
+        "Five players": lineup_labels,
+        "Minutes": lineup_minutes,
+        "Predicted rating": predicted,
+    })
+    rotation = rotation[rotation["Minutes"] >= 0.25].sort_values("Minutes", ascending=False)
+    with st.expander("See the five-player groups in this rotation"):
+        st.dataframe(
+            rotation.head(40).style.format({
+                "Minutes": "{:.1f}", "Predicted rating": "{:+.1f}"
+            }), use_container_width=True, hide_index=True,
+        )
 
 
 def render_team_builder(df, player_labels, player_options):
@@ -1534,22 +1902,25 @@ def render_team_builder(df, player_labels, player_options):
         '<div class="section-label">04 / Team Builder</div>',
         unsafe_allow_html=True
     )
-    st.header("Build a lineup")
+    st.header("Build a lineup or team")
 
     st.write(
-        "Choose five players to estimate how they might perform together. "
-        "The estimate is learned from real player and lineup data."
+        "Build a five-player lineup or a 12-player roster with a 240-minute "
+        "rotation. Estimates are learned from real player and lineup data."
     )
 
     with st.expander("How the estimate works"):
         st.markdown(
             "- Player stats are compared with others from the same season, "
             "so players from different eras can be combined.\n"
-            "- The model learns from real five-player lineups and checks its "
-            "estimates on lineups it did not learn from.\n"
+            "- It learns from observed two-, three-, four-, and five-player "
+            "groups. Its lineup score is checked only on five-player groups "
+            "held out during training.\n"
+            "- For a 12-player team, set each player's minutes; the app mixes "
+            "five-player groups to match that rotation.\n"
             "- It looks at each player's skills and how those skills may fit "
             "together.\n"
-            "- Lineups with at least 10 minutes count. Longer samples carry "
+            "- Player groups with at least 10 minutes count. Longer samples carry "
             "more weight, and short-sample results are pulled toward average.\n"
             "- Estimates are less certain for combinations unlike the ones "
             "in the data.\n"
@@ -1674,21 +2045,37 @@ def render_team_builder(df, player_labels, player_options):
             merged["Minutes"] + LINEUP_TARGET_PRIOR_MINUTES
         )
         merged["_target"] = sign * merged[source_col] * reliability
+        merged["_is_five"] = True
+        five_training_for_comparison = merged.copy()
         feature_cols = base_cols + [
             label for label, _, _ in ROLE_FEATURES if label in merged.columns
         ]
+        subunits, subunit_info = build_subunit_training(
+            df, lineup_data, zfeat, pools, tuple(base_cols), target_label,
+            float(merged["weight"].sum()),
+            (_lineup_cache_key(), target_label, tuple(base_cols),
+             TRIO_FILE.stat().st_mtime if TRIO_FILE.exists() else 0,
+             QUARTET_FILE.stat().st_mtime if QUARTET_FILE.exists() else 0),
+        )
+        if not subunits.empty:
+            merged = pd.concat([merged, subunits], ignore_index=True, copy=False)
+        usable_five = int(
+            merged.loc[merged["_is_five"], "_target"].notna().sum()
+        )
         usable = int(merged["_target"].notna().sum())
-        if usable < 500 or merged["Season"].nunique() < 3:
+        if usable_five < 500 or merged.loc[merged["_is_five"], "Season"].nunique() < 3:
             st.warning(
-                f"Only {usable} usable lineups across "
-                f"{merged['Season'].nunique()} seasons. That's too few to "
+                f"Only {usable_five} usable five-player lineups across "
+                f"{merged.loc[merged['_is_five'], 'Season'].nunique()} seasons. That's too few to "
                 "fit a trustworthy model."
             )
             return
         results = fit_builder_models(
             merged, feature_cols, "_target", "weight", ("Team", "Minutes"),
             interaction_cols=tuple(pools.get("interaction_cols", ())),
-            cache_key=(_lineup_cache_key(), target_label, tuple(feature_cols)),
+            cache_key=(_lineup_cache_key(), target_label, tuple(feature_cols),
+                       tuple(sorted(subunit_info.items()))),
+            eval_mask_col="_is_five", compact_design=True,
         )
     else:
         feature_cols = [
@@ -1796,13 +2183,17 @@ def render_team_builder(df, player_labels, player_options):
                     f"(about ±{future_add['rmse']:.1f} pts/100)."
                 )
         st.caption(
-            f"Training used {usable:,} lineup records with matched player stats "
-            f"and at least {LINEUP_MODEL_MIN_MINUTES} minutes, out of "
-            f"{lineup_info['lineups']:,} cleaned records "
-            f"({lineup_info['matched']:,} matched to player seasons). "
-            f"Those training records total {lineup_info['training_minutes']:,.0f} minutes. "
-            "Each record summarizes a five-player group, not one possession "
-            "or play."
+            f"The model learned from {usable_five:,} five-player lineups plus "
+            f"{subunit_info.get('2-player training rows', 0):,} two-player, "
+            f"{subunit_info.get('3-player training rows', 0):,} three-player, and "
+            f"{subunit_info.get('4-player training rows', 0):,} four-player groups. "
+            f"Its accuracy score uses only five-player lineups held out from fitting. "
+            f"The five-player files had {lineup_info['matched']:,} records matched "
+            f"to player seasons out of {lineup_info['lineups']:,} cleaned records. "
+            f"Included five-player records total {lineup_info['training_minutes']:,.0f} minutes. "
+            f"All group sizes require at least {LINEUP_MODEL_MIN_MINUTES} minutes. "
+            "Each record summarizes one group over many possessions, not one "
+            "possession or play."
         )
         with st.expander("How much lineup data made it into training?"):
             raw_rows = lineup_info.get("source_rows_raw")
@@ -1812,7 +2203,7 @@ def render_team_builder(df, player_labels, player_options):
             )
             cleaned_rows = lineup_info.get("source_rows_clean") or lineup_info["lineups"]
             matched_rows = lineup_info["matched"]
-            fit_rows = int(usable)
+            fit_rows = int(usable_five)
             st.write(f"**Read from files:** {raw_count}.")
             st.write(
                 f"**After parsing and removing duplicate/invalid rows:** "
@@ -1829,6 +2220,15 @@ def render_team_builder(df, player_labels, player_options):
                 f"{lineup_info.get('training_combinations', 0):,} distinct "
                 f"five-player combinations. The target rating was available "
                 f"for {fit_rows:,} of them."
+            )
+            st.write(
+                "**Additional interaction evidence:** "
+                f"{subunit_info.get('2-player training rows', 0):,} two-player, "
+                f"{subunit_info.get('3-player training rows', 0):,} three-player, "
+                f"and {subunit_info.get('4-player training rows', 0):,} "
+                "matched group-season records passed the minute cutoff. "
+                f"{subunit_info.get('subunit rows matched to player seasons', 0):,} "
+                "subunit records matched all of their players to player-season stats."
             )
             st.caption(
                 "So the headline training count is not the number of raw file "
@@ -1870,7 +2270,8 @@ def render_team_builder(df, player_labels, player_options):
     if use_lineups:
         with st.expander("How did the older team-based method do on real lineups?"):
             check = legacy_scale_check(
-                df, zfeat, profiles, merged, feature_cols, target_label
+                df, zfeat, profiles, five_training_for_comparison,
+                feature_cols, target_label
             )
             if check is None:
                 st.write("Couldn't run the comparison (it needs the team-level data).")
@@ -2076,6 +2477,21 @@ def render_team_builder(df, player_labels, player_options):
         )
     strict = guardrail_mode.startswith("Strict")
 
+    builder_mode = st.radio(
+        "What are you building?",
+        ["Five-player lineup", "12-player team"],
+        horizontal=True,
+        key="builder_roster_mode",
+    )
+    if builder_mode == "12-player team":
+        render_12_player_team_builder(
+            df, player_labels, player_options, zfeat, pools, base_cols,
+            feature_cols, chosen_key, chosen, results, target_label,
+            results["support"], strict, limit_pools, calib_scale,
+            basis_scale, use_pair_layer, pair_layer, blend_history,
+        )
+        return
+
     # ---- Pick five players ----
     st.markdown("#### Pick five players")
 
@@ -2155,7 +2571,7 @@ def render_team_builder(df, player_labels, player_options):
             projected_players = (
                 lineup_z[base_cols].to_numpy(dtype=np.float32) @ interaction_axes
             )[None, :, :]
-            pair_interaction_vec = _builder_pair_interactions(projected_players)[0]
+            pair_interaction_vec = _builder_group_interactions(projected_players)[0]
             if strict and results.get("interaction_support") is not None:
                 pair_support = results["interaction_support"]
                 pair_interaction_vec = np.clip(
@@ -2192,6 +2608,7 @@ def render_team_builder(df, player_labels, player_options):
                 feature_row, active_key == "interact", interaction_cols,
                 interaction_values=(pair_interaction_vec if pair_values is None
                                     else pair_values),
+                compact=results.get("compact_design", False),
             )
             row = row[active["columns"]]
             values = row.to_numpy(float)
@@ -2511,6 +2928,7 @@ def render_team_builder(df, player_labels, player_options):
                 interaction_cols,
                 interaction_values=(pair_interaction_vec if pair_values is None
                                     else pair_values),
+                compact=results.get("compact_design", False),
             )
             row = row[info["columns"]]
             return float(_ridge_predict(info["model"], row.to_numpy(float))[0])
@@ -2522,7 +2940,7 @@ def render_team_builder(df, player_labels, player_options):
         )
         pair_unscaled = pair_interaction_vec
         if interaction_cols and interaction_axes is not None and interaction_axes.shape[1]:
-            pair_unscaled = _builder_pair_interactions(
+            pair_unscaled = _builder_group_interactions(
                 (unscaled_z.to_numpy(dtype=np.float32) @ interaction_axes)[None, :, :]
             )[0]
         skills_only = model_for("additive", vec_unscaled)
@@ -2583,7 +3001,7 @@ def render_team_builder(df, player_labels, player_options):
                  - model_for(
                      active_key,
                      vec,
-                     _builder_pair_interactions(
+                     _builder_group_interactions(
                          (swapped[base_cols].to_numpy(dtype=np.float32) @ interaction_axes)[None, :, :]
                      )[0] if interaction_cols and interaction_axes is not None
                      and interaction_axes.shape[1] else pair_interaction_vec,
@@ -4190,7 +4608,8 @@ def lineup_sample_label(minutes):
 
 def _lineup_cache_key():
     stamps = []
-    for path in list(LINEUP_FILES) + [DATA_FILE, NAME_FILE, PAIR_FILE]:
+    for path in list(LINEUP_FILES) + [DATA_FILE, NAME_FILE, PAIR_FILE,
+                                     TRIO_FILE, QUARTET_FILE]:
         try:
             stamps.append(path.stat().st_mtime)
         except Exception:
@@ -4895,7 +5314,7 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
         keep_for_model = (Lm["Minutes"] >= LINEUP_MODEL_MIN_MINUTES).to_numpy()
         player_axis_scores = zvals @ interaction_axes
         lineup_axis_scores = player_axis_scores[zpos[keep_for_model]]
-        pair_values = _builder_pair_interactions(lineup_axis_scores)
+        pair_values = _builder_group_interactions(lineup_axis_scores)
         for i, column in enumerate(interaction_cols):
             prof[column] = np.nan
             prof.loc[keep_for_model, column] = pair_values[:, i]
@@ -4945,6 +5364,218 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
     report["training_combinations"] = int(training["LineupKey"].nunique())
     report["training_minutes"] = float(training["Minutes"].sum())
     return training, cores, {**pools, "cores": cores}, report
+
+
+@st.cache_resource(show_spinner="Preparing two-, three-, and four-player learning data...")
+def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
+                           target_label, reference_weight_total, cache_key):
+    """Create compact training rows from observed 2-, 3-, and 4-player groups.
+
+    Subunits teach the model how combinations of individual skills relate to
+    real outcomes. Five-player lineups remain the evaluation set.
+    """
+    base_cols = list(base_cols)
+    target_col = {
+        "Net rating": "NetRtg",
+        "Offense (points scored per 100)": "OffRtg",
+        "Defense (points prevented per 100)": "DefRtg",
+    }.get(target_label)
+    if target_col is None:
+        return pd.DataFrame(), {}
+    baseline_col = {"NetRtg": "LeagueNet", "OffRtg": "LeagueOff",
+                    "DefRtg": "LeagueDef"}[target_col]
+    # Use the exact league baseline used to center the five-player outcomes.
+    baseline = (
+        _lineup_data.groupby("Season")[baseline_col]
+        .first().to_dict()
+        if baseline_col in _lineup_data.columns else {}
+    )
+    row_of = _skill_row_lookup(_data).to_dict()
+    zvals = _zfeat[base_cols].to_numpy(dtype=np.float32, copy=False)
+    interaction_axes = _pools.get("interaction_axes")
+    interaction_cols = list(_pools.get("interaction_cols", ()))
+    player_axes = (zvals @ interaction_axes if interaction_axes is not None
+                   and interaction_axes.shape[1] else None)
+    records, stats = [], {}
+
+    # Two-player observations come from the already-normalized pair loader.
+    pair_data, pair_report = load_pairs() if PAIR_FILE.exists() else (None, {})
+    if pair_data is not None:
+        pair_column = target_col
+        pairs = pair_data[["Season", "Team", "TeamId", "PlayerA", "PlayerB",
+                           "Minutes", pair_column]].copy()
+        pairs = pairs.rename(columns={"PlayerA": "P1", "PlayerB": "P2"})
+        pairs["_size"] = 2
+        records.append(pairs)
+        stats["2-player source rows"] = len(pairs)
+    else:
+        stats["2-player source rows"] = 0
+
+    # These exports contain an EntityId made from player IDs joined by '-'.
+    for size, path in ((3, TRIO_FILE), (4, QUARTET_FILE)):
+        if not path.exists():
+            stats[f"{size}-player source rows"] = 0
+            continue
+        required = ["EntityId", "Season", "Minutes", "TeamId"]
+        columns = set(pd.read_csv(path, compression="gzip", nrows=0).columns)
+        usecols = [c for c in required + ["Team", "OffPoss", "DefPoss",
+                                           "Points", "OpponentPoints"]
+                   if c in columns]
+        raw = pd.read_csv(path, compression="gzip", usecols=usecols,
+                          low_memory=False)
+        raw["Season"] = raw["Season"].astype("string").str.strip()
+        ids = raw["EntityId"].astype("string").str.strip().str.split("-")
+        valid = ids.map(lambda value: isinstance(value, list) and len(value) == size
+                        and len(set(value)) == size)
+        raw = raw.loc[valid].copy()
+        ids = ids.loc[valid].map(
+            lambda value: sorted(
+                re.sub(r"\.0$", "", str(x).strip()) for x in value
+            )
+        )
+        raw["TeamId"] = _clean_id(raw["TeamId"])
+        if "Team" not in raw.columns:
+            raw["Team"] = raw["TeamId"]
+        raw["Minutes"] = pd.to_numeric(raw["Minutes"], errors="coerce")
+        for column in ("OffPoss", "DefPoss", "Points", "OpponentPoints"):
+            if column in raw:
+                raw[column] = pd.to_numeric(raw[column], errors="coerce")
+        raw["OffRtg"] = 100 * raw["Points"] / raw["OffPoss"].where(raw["OffPoss"] > 0)
+        raw["DefRtg"] = (100 * raw["OpponentPoints"]
+                         / raw["DefPoss"].where(raw["DefPoss"] > 0))
+        raw["NetRtg"] = raw["OffRtg"] - raw["DefRtg"]
+        group = pd.DataFrame({"Season": raw["Season"], "Team": raw["Team"],
+                              "TeamId": raw["TeamId"], "Minutes": raw["Minutes"],
+                              target_col: raw[target_col]})
+        for slot in range(size):
+            group[f"P{slot + 1}"] = ids.map(lambda value: value[slot])
+        group["_size"] = size
+        records.append(group)
+        stats[f"{size}-player source rows"] = len(group)
+        del raw, ids
+
+    if not records:
+        return pd.DataFrame(), stats
+    source = pd.concat(records, ignore_index=True, copy=False)
+    del records
+    source["Season"] = source["Season"].astype(str)
+    source["Minutes"] = pd.to_numeric(source["Minutes"], errors="coerce")
+    source = source[(source["Minutes"] >= LINEUP_MODEL_MIN_MINUTES)
+                    & source[target_col].notna()].copy()
+    if source.empty:
+        return pd.DataFrame(), stats
+    # Fill any season baselines missing from the five-man files from the
+    # weighted subunit observations available for that season.
+    for season, rows in source.groupby("Season").groups.items():
+        if season not in baseline:
+            values = source.loc[rows, target_col].to_numpy(float)
+            weights = source.loc[rows, "Minutes"].to_numpy(float)
+            baseline[season] = float(np.average(values, weights=weights))
+
+    group_size = source["_size"].to_numpy(dtype=int)
+    max_size = int(group_size.max())
+    id_matrix = np.full((len(source), max_size), "", dtype=object)
+    for slot in range(max_size):
+        col = f"P{slot + 1}"
+        if col in source:
+            id_matrix[:, slot] = source[col].fillna("").astype(str).to_numpy()
+    seasons = source["Season"].astype(str)
+    mapped = np.empty(id_matrix.shape, dtype=object)
+    for slot in range(max_size):
+        mapped[:, slot] = pd.Series(
+            [row_of.get(f"{pid}|{season}", np.nan)
+             for pid, season in zip(id_matrix[:, slot], seasons)],
+            index=source.index,
+        ).to_numpy()
+    matched = np.ones(len(source), dtype=bool)
+    for slot in range(max_size):
+        matched &= (slot < group_size) | (id_matrix[:, slot] == "")
+        matched &= (slot >= group_size) | pd.notna(mapped[:, slot])
+    stats["subunit rows after minute filter"] = len(source)
+    stats["subunit rows matched to player seasons"] = int(matched.sum())
+    source = source.loc[matched].reset_index(drop=True)
+    mapped = mapped[matched].astype(int)
+    group_size = group_size[matched]
+    if not len(source):
+        return pd.DataFrame(), stats
+
+    profile_values = np.zeros((len(source), len(base_cols)), dtype=np.float32)
+    for slot in range(max_size):
+        active = group_size > slot
+        if active.any():
+            profile_values[active] += zvals[mapped[active, slot]]
+    profile_values /= group_size[:, None]
+    profile = pd.DataFrame(profile_values, columns=base_cols)
+    feature_index = {name: i for i, name in enumerate(base_cols)}
+    role_data = {}
+    for label, feature, how in ROLE_FEATURES:
+        if feature not in feature_index:
+            continue
+        values = np.zeros(len(source), dtype=np.float32)
+        values[:] = zvals[mapped[:, 0], feature_index[feature]]
+        for slot in range(1, max_size):
+            active = group_size > slot
+            if active.any():
+                next_values = zvals[mapped[active, slot], feature_index[feature]]
+                values[active] = (np.maximum(values[active], next_values)
+                                  if how == "max" else np.minimum(values[active], next_values))
+        role_data[label] = values
+    if role_data:
+        profile = pd.concat([profile, pd.DataFrame(role_data)], axis=1, copy=False)
+
+    if interaction_cols and player_axes is not None:
+        interactions = np.zeros((len(source), len(interaction_cols)), dtype=np.float32)
+        for size in (2, 3, 4):
+            rows = np.flatnonzero(group_size == size)
+            if not len(rows):
+                continue
+            projected = player_axes[mapped[rows, :size]]
+            interactions[rows] = _builder_group_interactions(projected)
+        profile = pd.concat(
+            [profile, pd.DataFrame(interactions, columns=interaction_cols)],
+            axis=1, copy=False,
+        )
+        del interactions
+
+    season_base = source["Season"].astype(str).map(baseline).to_numpy(float)
+    reliability = source["Minutes"].to_numpy(float) / (
+        source["Minutes"].to_numpy(float) + LINEUP_TARGET_PRIOR_MINUTES
+    )
+    raw_outcome = source[target_col].to_numpy(float) - season_base
+    if target_col == "DefRtg":
+        raw_outcome *= -1
+    profile["_target"] = raw_outcome * reliability
+    subunit_weights = np.minimum(
+        source["Minutes"].to_numpy(float), LINEUP_WEIGHT_CAP
+    )
+    # Keep the much larger subunit exports from numerically overwhelming the
+    # five-man evidence. Every group size contributes the same total fitting
+    # weight as the real five-man lineups, while all qualifying rows remain.
+    for size in (2, 3, 4):
+        rows = group_size == size
+        total = float(subunit_weights[rows].sum())
+        if rows.any() and total > 0:
+            subunit_weights[rows] *= float(reference_weight_total) / total
+    profile["weight"] = subunit_weights
+    profile["Season"] = source["Season"].to_numpy()
+    profile["Team"] = source["Team"].fillna("").astype(str).to_numpy()
+    ids_for_key = id_matrix[matched]
+    profile["LineupKey"] = [
+        "-".join(sorted(str(pid) for pid in ids_for_key[i, :group_size[i]]))
+        for i in range(len(profile))
+    ]
+    team_id = source["TeamId"].fillna(source["Team"]).astype(str).to_numpy()
+    profile["Tm"] = team_id + ":" + profile["LineupKey"]
+    profile["Era"] = profile["Season"].map(
+        lambda season: era_for_year(season_start_year(season))
+    )
+    profile["Core five"] = [f"{size}-player group" for size in group_size]
+    profile["_is_five"] = False
+    stats["2-player training rows"] = int((group_size == 2).sum())
+    stats["3-player training rows"] = int((group_size == 3).sum())
+    stats["4-player training rows"] = int((group_size == 4).sum())
+    stats["training minutes"] = float(source.loc[:, "Minutes"].sum())
+    return profile, stats
 
 
 def legacy_scale_check(df, zfeat, profiles, training, feature_cols, target_label):

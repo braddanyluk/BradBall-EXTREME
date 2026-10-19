@@ -1896,6 +1896,57 @@ def render_12_player_team_builder(
         )
 
 
+def lineup_noise_diagnostics(actual, predicted, minutes, weights=None):
+    """How much of a lineup model's error is just sampling noise?
+
+    A lineup's observed rating wobbles around its true level by an amount
+    that shrinks with minutes (variance roughly proportional to 1 / minutes).
+    Model error doesn't depend on minutes. So squared residuals follow
+        residual^2  ~  model_error + noise_coefficient / minutes,
+    and fitting that line separates the two. The noise part is a ceiling no
+    model can beat on these ratings; the model-error part is room to improve.
+    """
+    actual = np.asarray(actual, float)
+    predicted = np.asarray(predicted, float)
+    minutes = np.asarray(minutes, float)
+    w = np.ones(len(actual)) if weights is None else np.asarray(weights, float)
+    ok = (np.isfinite(actual) & np.isfinite(predicted) & np.isfinite(minutes)
+          & np.isfinite(w) & (minutes > 0))
+    actual, predicted, minutes, w = actual[ok], predicted[ok], minutes[ok], w[ok]
+    if len(actual) < 200:
+        return None
+    w = w / w.mean()
+
+    resid2 = (actual - predicted) ** 2
+    inverse = 1.0 / minutes
+    if np.ptp(inverse) <= 0:
+        return None
+    design = np.column_stack([np.ones_like(inverse), inverse])
+    coef = np.linalg.solve(design.T @ (design * w[:, None]), design.T @ (w * resid2))
+    noise_coef = max(float(coef[1]), 0.0)
+
+    def summarize(mask):
+        if mask.sum() < 50:
+            return None
+        ww = w[mask]
+        y_bar = (ww * actual[mask]).sum() / ww.sum()
+        total = float((ww * (actual[mask] - y_bar) ** 2).sum() / ww.sum())
+        resid = float((ww * resid2[mask]).sum() / ww.sum())
+        noise = min(float(noise_coef * (ww * inverse[mask]).sum() / ww.sum()), resid)
+        return {
+            "r2": 1 - resid / total,
+            "ceiling": 1 - noise / total,
+            "headroom": max(resid - noise, 0.0) / total,
+            "rows": int(mask.sum()),
+        }
+
+    return {
+        "all": summarize(np.ones(len(actual), dtype=bool)),
+        "solid": summarize(minutes >= 300),
+        "noise_coef": noise_coef,
+    }
+
+
 def render_team_builder(df, player_labels, player_options):
     """The Team Builder tab: a model learned from historical teams."""
     st.markdown(
@@ -2038,13 +2089,13 @@ def render_team_builder(df, player_labels, player_options):
             return
 
         merged = training.copy()
-        # A short lineup sample is less stable than a long one. Shrink its
-        # observed deviation toward league average before fitting; minute
-        # weights still let the larger samples carry more information.
-        reliability = merged["Minutes"] / (
-            merged["Minutes"] + LINEUP_TARGET_PRIOR_MINUTES
-        )
-        merged["_target"] = sign * merged[source_col] * reliability
+        # Train on the real rating. Short samples are noisy, but noise in the
+        # thing being predicted doesn't bias a regression; it only adds
+        # variance, and the minute weights already make short samples count
+        # for less. Rescaling the ratings toward zero as well would teach the
+        # model that lineups perform worse than they do, so every prediction
+        # would come out too small.
+        merged["_target"] = sign * merged[source_col]
         merged["_is_five"] = True
         five_training_for_comparison = merged.copy()
         feature_cols = base_cols + [
@@ -2161,8 +2212,45 @@ def render_team_builder(df, player_labels, player_options):
             "“Differences explained” compares the model with guessing the "
             "average lineup. It is not the percent of predictions that are "
             "correct. The typical error is an average, not a guaranteed range. "
-            "Short-minute ratings are pulled toward league average before fitting."
+            "Lineups are weighted by minutes, so short samples count for less."
         )
+        results_frame = results["data"]
+        noise_info = (
+            lineup_noise_diagnostics(
+                results_frame["actual"], interact["oof"],
+                results_frame["Minutes"], results_frame.get("weight"),
+            )
+            if "Minutes" in results_frame.columns else None
+        )
+        if noise_info and noise_info["all"]:
+            n1, n2, n3 = st.columns(3)
+            n1.metric(
+                "Best any model could score",
+                f"{noise_info['all']['ceiling']:.1%} explained",
+                help="Short lineups are mostly luck. This is the share of "
+                     "lineup-to-lineup variation that isn't sampling noise, "
+                     "estimated from how errors shrink as minutes grow.",
+            )
+            n2.metric(
+                "Room left to improve",
+                f"{noise_info['all']['headroom']:.1%} points",
+                help="Error that isn't explained by noise: what a better "
+                     "model could still capture.",
+            )
+            solid = noise_info.get("solid")
+            n3.metric(
+                "Score on 300+ minute lineups",
+                "—" if not solid else f"{solid['r2']:.1%} explained",
+                delta=None if not solid else f"ceiling {solid['ceiling']:.1%}",
+                delta_color="off",
+                help="Longer samples are less noisy, so this is the fairer "
+                     "test of the model.",
+            )
+            st.caption(
+                "Read the score against the ceiling, not against 100%. A model "
+                "at the ceiling has learned everything the data can teach; "
+                "'room left' says how much a better model could still add."
+            )
         if additive.get("future") and interact.get("future"):
             future_add, future_pair = additive["future"], interact["future"]
             seasons = future_pair["seasons"]
@@ -4583,7 +4671,6 @@ LINEUP_TARGET_COLUMNS = {
 LINEUP_MODEL_MIN_MINUTES = 10     # include short samples, but skip the noisiest
 LINEUP_WEIGHT_CAP = 800           # no single lineup counts for more than this
 LINEUP_SHRINK_MINUTES = 800       # Lineup Lab's historical display shrinkage
-LINEUP_TARGET_PRIOR_MINUTES = 200 # Team Builder target reliability prior
 LINEUP_CAP_MIN_MINUTES = 200      # lineups used to set "most ever" resource limits
 
 LINEUP_SAMPLE_LABELS = [
@@ -5480,21 +5567,22 @@ def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
         if col in source:
             id_matrix[:, slot] = source[col].fillna("").astype(str).to_numpy()
     seasons = source["Season"].astype(str)
-    mapped = np.empty(id_matrix.shape, dtype=object)
+    mapped = np.zeros(id_matrix.shape, dtype=np.int64)
+    matched = np.ones(len(source), dtype=bool)
     for slot in range(max_size):
-        mapped[:, slot] = pd.Series(
+        row_indices = pd.Series(
             [row_of.get(f"{pid}|{season}", np.nan)
              for pid, season in zip(id_matrix[:, slot], seasons)],
             index=source.index,
         ).to_numpy()
-    matched = np.ones(len(source), dtype=bool)
-    for slot in range(max_size):
-        matched &= (slot < group_size) | (id_matrix[:, slot] == "")
-        matched &= (slot >= group_size) | pd.notna(mapped[:, slot])
+        active = group_size > slot
+        has_match = pd.notna(row_indices)
+        mapped[active & has_match, slot] = row_indices[active & has_match].astype(np.int64)
+        matched &= ~active | has_match
     stats["subunit rows after minute filter"] = len(source)
     stats["subunit rows matched to player seasons"] = int(matched.sum())
     source = source.loc[matched].reset_index(drop=True)
-    mapped = mapped[matched].astype(int)
+    mapped = mapped[matched]
     group_size = group_size[matched]
     if not len(source):
         return pd.DataFrame(), stats
@@ -5538,13 +5626,11 @@ def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
         del interactions
 
     season_base = source["Season"].astype(str).map(baseline).to_numpy(float)
-    reliability = source["Minutes"].to_numpy(float) / (
-        source["Minutes"].to_numpy(float) + LINEUP_TARGET_PRIOR_MINUTES
-    )
     raw_outcome = source[target_col].to_numpy(float) - season_base
     if target_col == "DefRtg":
         raw_outcome *= -1
-    profile["_target"] = raw_outcome * reliability
+    # The real rating, not one shrunk toward zero (see the five-man path).
+    profile["_target"] = raw_outcome
     subunit_weights = np.minimum(
         source["Minutes"].to_numpy(float), LINEUP_WEIGHT_CAP
     )
@@ -6511,25 +6597,3 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -1855,17 +1855,33 @@ def render_12_player_team_builder(
     predicted = np.asarray(predicted, dtype=float)
     lineup_minutes = np.asarray(lineup_minutes, dtype=float)
     average = float(np.average(predicted, weights=lineup_minutes))
-    error = float(chosen["rmse"] * basis_scale * max(1.0, calib_scale))
+    error_split = lineup_error_split(results, chosen)
+    # Luck averages out across a whole rotation, but the model's own error
+    # doesn't (the same players drive every lineup), so use it undiluted.
+    model_error = error_split["model_sd"] if error_split is not None else chosen["rmse"]
+    error = float(model_error * basis_scale * max(1.0, calib_scale))
 
     c1, c2, c3 = st.columns(3)
     c1.metric(f"Predicted team {target_label.split(' (')[0].lower()}", f"{average:+.1f} per 100")
-    c2.metric("Approx. 80% model range", f"{average - 1.28 * error:+.1f} to {average + 1.28 * error:+.1f}")
+    c2.metric(
+        "Approx. 80% range (true level)",
+        f"{average - 1.28 * error:+.1f} to {average + 1.28 * error:+.1f}",
+        help="Where this team's real strength likely sits, from the model's "
+             "own error with game-to-game luck removed.",
+    )
     c3.metric("Five-player groups in rotation", f"{len(lineup_indices):,}")
     st.caption(
         "This is a minute-weighted estimate across the rotation. The app "
         "uses a balanced mix of groups that matches your minutes, instead "
         "of assuming only the highest-rated groups will play."
     )
+    if error_split is not None:
+        season_luck = 1.28 * float(np.sqrt(error_split["noise_coef"] / 3936.0)) * basis_scale
+        st.caption(
+            f"That range is for the team's real strength. Over a full season "
+            f"(about 3,900 minutes), luck would add only about "
+            f"±{season_luck:.1f} more."
+        )
 
     actual_by_player = np.zeros(12, dtype=float)
     for group, minutes in zip(lineup_indices, lineup_minutes):
@@ -1924,6 +1940,7 @@ def lineup_noise_diagnostics(actual, predicted, minutes, weights=None):
     design = np.column_stack([np.ones_like(inverse), inverse])
     coef = np.linalg.solve(design.T @ (design * w[:, None]), design.T @ (w * resid2))
     noise_coef = max(float(coef[1]), 0.0)
+    model_var = max(float(coef[0]), 0.0)
 
     def summarize(mask):
         if mask.sum() < 50:
@@ -1940,11 +1957,31 @@ def lineup_noise_diagnostics(actual, predicted, minutes, weights=None):
             "rows": int(mask.sum()),
         }
 
+    overall_resid = float((w * resid2).sum() / w.sum())
     return {
         "all": summarize(np.ones(len(actual), dtype=bool)),
         "solid": summarize(minutes >= 300),
         "noise_coef": noise_coef,
+        # The model's own error about a lineup's true level, excluding luck.
+        "model_sd": float(np.sqrt(min(model_var, overall_resid))),
+        # Typical miss against measured ratings, luck included.
+        "rmse": float(np.sqrt(overall_resid)),
     }
+
+
+def lineup_error_split(results, model):
+    """Split a lineup model's error into its own error and plain luck.
+
+    Measured lineup ratings are noisy, and the noise is worst in short
+    samples. A range built from the raw miss is mostly that luck, which says
+    little about what a lineup is worth. Returns None without minutes.
+    """
+    frame = results["data"]
+    if "Minutes" not in frame.columns:
+        return None
+    return lineup_noise_diagnostics(
+        frame["actual"], model["oof"], frame["Minutes"], frame.get("weight"),
+    )
 
 
 def render_team_builder(df, player_labels, player_options):
@@ -2202,7 +2239,12 @@ def render_team_builder(df, player_labels, player_options):
     if use_lineups:
         m1, m2, m3 = st.columns(3)
         m1.metric("Skill-fit model", f"{interact['r2']:.1%} of differences explained")
-        m2.metric("Typical error on new lineups", f"about ±{interact['rmse']:.1f} pts/100")
+        m2.metric(
+            "Typical miss vs. measured ratings",
+            f"about ±{interact['rmse']:.1f} pts/100",
+            help="Includes luck in short samples, which no model can "
+                 "predict. The model's own error is smaller; see below.",
+        )
         m3.metric(
             "Skills added together",
             f"{additive['r2']:.1%} of differences explained",
@@ -2250,6 +2292,11 @@ def render_team_builder(df, player_labels, player_options):
                 "Read the score against the ceiling, not against 100%. A model "
                 "at the ceiling has learned everything the data can teach; "
                 "'room left' says how much a better model could still add."
+            )
+            st.caption(
+                f"Of the typical ±{noise_info['rmse']:.1f} miss, about "
+                f"±{noise_info['model_sd']:.1f} is the model's own error. "
+                "The rest is luck in short samples, which no model can predict."
             )
         if additive.get("future") and interact.get("future"):
             future_add, future_pair = additive["future"], interact["future"]
@@ -2742,11 +2789,18 @@ def render_team_builder(df, player_labels, player_options):
         # the lineup is from anything real. Add ordinary prediction noise.
         boot_predictions = _boot_predict(active["boot"], X)
         boot_spread = float(boot_predictions.std())
-        error_used = (
-            pair_layer["backtest"]["rmse_with"]
-            if use_pair_layer and "rmse_with" in pair_layer["backtest"]
-            else active["rmse"]
-        )
+        error_split = lineup_error_split(results, active)
+        if error_split is not None:
+            # The model's own uncertainty about this lineup's true level.
+            # Luck in short samples is real, but it is not uncertainty about
+            # the lineup, so it is shown separately below.
+            error_used = error_split["model_sd"]
+        else:
+            error_used = (
+                pair_layer["backtest"]["rmse_with"]
+                if use_pair_layer and "rmse_with" in pair_layer["backtest"]
+                else active["rmse"]
+            )
         total_spread = float(np.sqrt(boot_spread ** 2 + error_used ** 2))
         total_spread *= basis_scale * max(1.0, calib_scale)
         low = prediction - 1.28 * total_spread
@@ -2779,12 +2833,13 @@ def render_team_builder(df, player_labels, player_options):
                  "average team of the same season.",
         )
         r2.metric(
-            "Approx. 80% model range",
+            "Approx. 80% range (true level)",
             "Capped" if capped_by_history else f"{low:+.1f} to {high:+.1f}",
-            help="Combines held-out prediction error with variation across "
-                 "season-resampled fits, then uses a normal-error multiplier. "
-                 "It has not been calibrated to contain 80% of future lineup "
-                 "results. A wide range means the estimate is weak.",
+            help="Where this lineup's real strength likely sits. It combines "
+                 "the model's own error (measured on held-out lineups, with "
+                 "game-to-game luck removed) and variation across "
+                 "season-resampled fits. It does not include luck in a short "
+                 "stretch of games; that's shown below.",
         )
         r3.metric(
             "How unusual is this group?",
@@ -2792,6 +2847,17 @@ def render_team_builder(df, player_labels, player_options):
             help=f"More unusual than {unusual_pct:.0f}% of real "
                  "historical cores.",
         )
+
+        if error_split is not None and not capped_by_history:
+            luck_sd = float(np.sqrt(error_split["noise_coef"] / 500.0)) * basis_scale
+            stretch_half = 1.28 * float(np.sqrt(total_spread ** 2 + luck_sd ** 2))
+            st.caption(
+                f"That range is for the lineup's real strength. Over a "
+                f"500-minute stretch, luck adds more: its measured rating "
+                f"would typically land between {prediction - stretch_half:+.1f} "
+                f"and {prediction + stretch_half:+.1f}. Longer stretches "
+                "narrow it."
+            )
 
         if active_key == "interact" and unusual_pct >= 99:
             st.caption(

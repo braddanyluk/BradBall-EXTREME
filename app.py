@@ -873,6 +873,11 @@ ROLE_FEATURES = [
     ("Best rim protector", "Blocks /100", "max"),
     ("Best rim attacker", "Rim attempts /100", "max"),
     ("Best rebounder", "Def. rebounds /100", "max"),
+    # More about who covers which job. "second" is the second-highest of the five.
+    ("Second-best passer", "Assists /100", "second"),
+    ("Best self-creator", "Unassisted scoring /100", "max"),
+    ("Most dependent finisher", "Assisted share of FG points", "max"),
+    ("Turnover risk (highest turnover rate)", "Turnovers /100", "max"),
 ]
 
 BUILDER_BOOTSTRAPS = 150
@@ -1001,7 +1006,12 @@ def role_values(z_rows):
     for label, feature, how in ROLE_FEATURES:
         if feature in z_rows.columns:
             column = z_rows[feature]
-            values[label] = column.max() if how == "max" else column.min()
+            if how == "max":
+                values[label] = column.max()
+            elif how == "min":
+                values[label] = column.min()
+            else:
+                values[label] = column.nlargest(2).iloc[-1]
     return pd.Series(values, dtype=float)
 
 
@@ -1074,7 +1084,12 @@ def builder_tables(data):
     for label, feature, how in ROLE_FEATURES:
         if feature in zt.columns:
             grouped = zt[feature].groupby(keys)
-            profile[label] = grouped.max() if how == "max" else grouped.min()
+            if how == "max":
+                profile[label] = grouped.max()
+            elif how == "min":
+                profile[label] = grouped.min()
+            else:
+                profile[label] = grouped.apply(lambda s: s.nlargest(2).iloc[-1])
     profile["Core five"] = top.groupby(["Season", "Tm"])["player_name"].agg(
         lambda s: ", ".join(s.astype(str))
     )
@@ -3098,12 +3113,27 @@ def render_team_builder(df, player_labels, player_options):
                 (unscaled_z.to_numpy(dtype=np.float32) @ interaction_axes)[None, :, :]
             )[0]
         skills_only = model_for("additive", vec_unscaled)
+        # How much of the skills number is talent, and how much is having the
+        # jobs covered (a passer, a spacer, a rim protector, a self-creator...)?
+        # Set every coverage feature to its typical value and see what's left.
+        additive_info = results["additive"]
+        neutral_vec = vec_unscaled.copy()
+        for role_label, _, _ in ROLE_FEATURES:
+            if role_label in feature_cols and role_label in additive_info["columns"]:
+                neutral_vec[feature_cols.index(role_label)] = float(
+                    additive_info["model"][0][additive_info["columns"].index(role_label)]
+                )
+        talent_only = model_for("additive", neutral_vec)
         active_unscaled = model_for(active_key, vec_unscaled, pair_unscaled)
         active_limited = model_for(active_key, raw_vec, pair_interaction_vec)
 
         stage_rows = [
-            ("Individual skills (sum of parts)", skills_only,
-             "What the five can do, added up, vs. an average team."),
+            ("Talent (average skill)", talent_only,
+             "What the five can do on average, vs. an average team."),
+            ("Roles covered", skills_only - talent_only,
+             "Credit or penalty for having, or lacking, a passer, a spacer, "
+             "a rim protector, a self-creator and so on. This is the fit "
+             "the skills number already contains."),
             ("Skill interactions, including player-pair fit",
              active_unscaled - skills_only,
              "Credit or penalty learned from how skills combine across the five players."),
@@ -5474,6 +5504,13 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
     feature_index = {c: i for i, c in enumerate(base_cols)}
     for label, feature, how in ROLE_FEATURES:
         if feature in feature_index:
+            if how == "second":
+                stack = np.stack(
+                    [zvals[zpos[:, slot], feature_index[feature]] for slot in range(5)],
+                    axis=1,
+                )
+                prof[label] = np.sort(stack, axis=1)[:, -2]
+                continue
             column = zvals[zpos[:, 0], feature_index[feature]]
             for player_slot in range(1, 5):
                 player_values = zvals[zpos[:, player_slot], feature_index[feature]]
@@ -5664,6 +5701,15 @@ def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
     role_data = {}
     for label, feature, how in ROLE_FEATURES:
         if feature not in feature_index:
+            continue
+        if how == "second":
+            stack = np.full((len(source), max_size), -np.inf, dtype=np.float32)
+            for slot in range(max_size):
+                active = group_size > slot
+                if active.any():
+                    stack[active, slot] = zvals[mapped[active, slot], feature_index[feature]]
+            ordered = np.sort(stack, axis=1)
+            role_data[label] = np.where(np.isfinite(ordered[:, -2]), ordered[:, -2], ordered[:, -1])
             continue
         values = np.zeros(len(source), dtype=np.float32)
         values[:] = zvals[mapped[:, 0], feature_index[feature]]

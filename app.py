@@ -2547,8 +2547,9 @@ def render_team_builder(df, player_labels, player_options):
             st.write("Not enough data to check.")
         else:
             st.write(
-                f"On seasons it never saw, when the model predicted +1.0, "
-                f"teams actually averaged {cal['slope']:+.2f}."
+                f"On held-out five-player lineups, a 1-point difference in "
+                f"prediction corresponded to about {cal['slope']:.2f} points "
+                "of difference in actual results."
             )
             st.dataframe(
                 cal["table"].style.format(
@@ -2560,8 +2561,8 @@ def render_team_builder(df, player_labels, player_options):
                 st.info(
                     "Predictions look compressed: the best-looking teams did "
                     "better than predicted and the worst did worse. That's "
-                    "typical of a cautious model, and 'Stretch predictions' "
-                    "below corrects for it."
+                    "typical of a cautious model, and the option below "
+                    "corrects for it."
                 )
             elif cal["slope"] <= 0.9:
                 st.info(
@@ -2572,12 +2573,12 @@ def render_team_builder(df, player_labels, player_options):
                 st.success("Predictions line up well with what happened.")
 
     calibrate = st.checkbox(
-        "Stretch predictions to match history",
-        value=False,
-        key="builder_calibrate",
-        help="Applies the calibration slope above to the skills "
-             "prediction. Only worth turning on if the check shows "
-             "predictions are compressed.",
+        "Widen predictions when the backtest says they’re too cautious",
+        value=bool(not np.isnan(cal["slope"]) and cal["slope"] >= 1.15),
+        key="builder_calibrate_v2",
+        help="The held-out lineup results decide whether to spread ratings "
+             "farther from average. It turns on by default only when the "
+             "backtest shows compression, and is capped at 1.8×.",
     )
 
     # The model learns from whole teams, whose benches dilute the five best
@@ -2586,6 +2587,11 @@ def render_team_builder(df, player_labels, player_options):
     core_share = None if use_lineups else top_five_minute_share(df)
     basis_scale = (1.0 / core_share) if core_share else 1.0
     calib_scale = cal["scale"] if (calibrate and not np.isnan(cal["slope"])) else 1.0
+    if calibrate and calib_scale > 1.0:
+        st.caption(
+            f"The backtest says the ratings are too close to average, so "
+            f"I’m spreading them by {calib_scale:.2f}×."
+        )
     if use_lineups:
         st.caption(
             "Ratings are for these five on the floor together, learned "
@@ -4723,7 +4729,9 @@ def calibration_summary(actual, predicted, weights=None):
 
     slope = float((w * (predicted - mp) * (actual - ma)).sum() / w.sum() / variance)
     out["slope"] = slope
-    out["scale"] = float(np.clip(slope, 0.8, 1.6))
+    # Use only the held-out calibration slope, with a cap so noisy estimates
+    # cannot turn a small signal into an extreme prediction.
+    out["scale"] = float(np.clip(slope, 0.8, 1.8))
 
     bins = pd.qcut(predicted, 5, duplicates="drop")
     table = pd.DataFrame({"bin": bins, "p": predicted, "a": actual, "w": w})

@@ -1984,6 +1984,38 @@ def lineup_noise_diagnostics(actual, predicted, minutes, weights=None):
     }
 
 
+@st.cache_resource(show_spinner="Splitting the rating into offense and defense...")
+def fit_split_models(_profiles, feature_cols, target_col, companion_col, weight_col,
+                     interaction_cols, alphas, cache_key):
+    """Offense models that use exactly the net model's settings.
+
+    Ridge regression is linear in the thing being predicted. So if offense is
+    fit on the same rows, with the same weights, the same design and the same
+    regularization as net, then defense = net - offense is exactly what a
+    defense model with those settings would have produced, and the three add
+    up by construction. Returns None if the offense rating isn't available on
+    every training row.
+    """
+    data = _profiles.dropna(subset=[target_col]).reset_index(drop=True)
+    y_companion = data[companion_col].to_numpy(float)
+    if not np.isfinite(y_companion).all():
+        return None
+    weights = data[weight_col].to_numpy(float)
+    weights = weights / weights.mean()
+
+    models = {}
+    for index, (name, interactions) in enumerate((("additive", False), ("interact", True))):
+        design = _builder_design(
+            data[list(feature_cols)], interactions, interaction_cols,
+            interaction_frame=data if interactions and interaction_cols else None,
+            compact=True,
+        )
+        X = design.to_numpy(dtype=np.float32, copy=False)
+        models[name] = _ridge_fit(X, y_companion, alphas[index], weights)
+        del design, X
+    return models
+
+
 def lineup_error_split(results, model):
     """Split a lineup model's error into its own error and plain luck.
 
@@ -2126,6 +2158,7 @@ def render_team_builder(df, player_labels, player_options):
         key="builder_target",
     )
     source_col, sign = targets[target_label]
+    split_models = None
 
     if use_lineups:
         training, _, pools, lineup_info = build_lineup_training(
@@ -2149,6 +2182,10 @@ def render_team_builder(df, player_labels, player_options):
         # would come out too small.
         merged["_target"] = sign * merged[source_col]
         merged["_is_five"] = True
+        if target_label == "Net rating" and "OffC" in merged.columns:
+            # Net is the anchor. Offense is fit with net's settings, and
+            # defense is whatever is left, so the three always add up.
+            merged["_companion"] = merged["OffC"]
         five_training_for_comparison = merged.copy()
         feature_cols = base_cols + [
             label for label, _, _ in ROLE_FEATURES if label in merged.columns
@@ -2159,6 +2196,8 @@ def render_team_builder(df, player_labels, player_options):
             (_lineup_cache_key(), target_label, tuple(base_cols),
              TRIO_FILE.stat().st_mtime if TRIO_FILE.exists() else 0,
              QUARTET_FILE.stat().st_mtime if QUARTET_FILE.exists() else 0),
+            companion_label=("Offense (points scored per 100)"
+                             if target_label == "Net rating" else None),
         )
         if not subunits.empty:
             merged = pd.concat([merged, subunits], ignore_index=True, copy=False)
@@ -2180,6 +2219,18 @@ def render_team_builder(df, player_labels, player_options):
                        tuple(sorted(subunit_info.items()))),
             eval_mask_col="_is_five", compact_design=True,
         )
+        if target_label == "Net rating" and "_companion" in merged.columns:
+            try:
+                split_models = fit_split_models(
+                    merged, tuple(feature_cols), "_target", "_companion", "weight",
+                    tuple(pools.get("interaction_cols", ())),
+                    (results["additive"]["alpha"], results["interact"]["alpha"]),
+                    (_lineup_cache_key(), target_label, tuple(feature_cols),
+                     tuple(sorted(subunit_info.items()))),
+                )
+            except Exception as error:
+                split_models = None
+                st.caption(f"The offense and defense split is unavailable: {error}")
     else:
         feature_cols = [
             c for c in profiles.columns
@@ -2785,6 +2836,7 @@ def render_team_builder(df, player_labels, player_options):
 
         trust = 1.0
         capped_by_history = False
+        raw_net_value = None
 
         if strict:
             # Keep inputs inside history, shrink if far outside, and cap.
@@ -2799,12 +2851,26 @@ def render_team_builder(df, player_labels, player_options):
                 prediction, capped_by_history = worst_seen, True
         else:
             X, prediction = model_output(raw_vec)
+            raw_net_value = float(prediction)
             prediction *= calib_scale
             prediction += synergy_effect
 
         # Everything above is on the model's native, whole-team basis.
         prediction_team = prediction
         prediction = prediction_team * basis_scale
+
+        # Offense and defense, from the same model settings as net. The pieces
+        # add up to the model's net number; pair chemistry is shown unsplit.
+        split_parts = None
+        if (split_models is not None and not strict and not capped_by_history
+                and raw_net_value is not None):
+            offense_raw = float(_ridge_predict(split_models[active_key], X)[0])
+            net_part = raw_net_value * calib_scale
+            offense_part = offense_raw * calib_scale
+            split_parts = {
+                "net": net_part, "offense": offense_part,
+                "defense": net_part - offense_part, "other": float(synergy_effect),
+            }
 
         # Uncertainty: resampled-history models disagree more the further
         # the lineup is from anything real. Add ordinary prediction noise.
@@ -3094,6 +3160,30 @@ def render_team_builder(df, player_labels, player_options):
                        "agreement here isn't an independent test."
                        if use_lineups else "")
                 )
+
+        if split_parts is not None:
+            st.markdown("#### Offense and defense")
+            split_rows = [(
+                "Skills and fit (the model)",
+                split_parts["net"], split_parts["offense"], split_parts["defense"],
+            )]
+            if use_pair_layer and abs(split_parts["other"]) >= 0.005:
+                split_rows.append((
+                    "Pair chemistry (not split)", split_parts["other"], np.nan, np.nan,
+                ))
+            st.dataframe(
+                pd.DataFrame(split_rows, columns=["Part", "Net", "Offense", "Defense"])
+                .style.format({"Net": "{:+.2f}", "Offense": "{:+.2f}", "Defense": "{:+.2f}"}, na_rep="—"),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Offense is fit with exactly the same settings as net, and "
+                "defense is net minus offense, so the three always add up. "
+                "Defense inherits the errors of both models, so treat it as "
+                "the less certain half. Pair chemistry is a net-only "
+                "adjustment and isn't split."
+            )
 
         # ---- How this number was built ----
         def model_for(key, vector, pair_values=None):
@@ -5566,7 +5656,8 @@ def build_lineup_training(_data, _lineups, _zfeat, _pools, base_cols, cache_key)
 
 @st.cache_resource(show_spinner="Preparing two-, three-, and four-player learning data...")
 def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
-                           target_label, reference_weight_total, cache_key):
+                           target_label, reference_weight_total, cache_key,
+        companion_label=None):
     """Create compact training rows from observed 2-, 3-, and 4-player groups.
 
     Subunits teach the model how combinations of individual skills relate to
@@ -5596,12 +5687,19 @@ def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
                    and interaction_axes.shape[1] else None)
     records, stats = [], {}
 
+    # The offense rating rides along on exactly the same rows as the net
+    # rating, so a companion model can be fit on identical data.
+    companion_col = {"Offense (points scored per 100)": "OffRtg"}.get(companion_label)
+    companion_baseline = {}
+    if companion_col is not None and "LeagueOff" in _lineup_data.columns:
+        companion_baseline = _lineup_data.groupby("Season")["LeagueOff"].first().to_dict()
+
     # Two-player observations come from the already-normalized pair loader.
     pair_data, pair_report = load_pairs() if PAIR_FILE.exists() else (None, {})
     if pair_data is not None:
         pair_column = target_col
         pairs = pair_data[["Season", "Team", "TeamId", "PlayerA", "PlayerB",
-                           "Minutes", pair_column]].copy()
+                           "Minutes", pair_column, *([companion_col] if companion_col else [])]].copy()
         pairs = pairs.rename(columns={"PlayerA": "P1", "PlayerB": "P2"})
         pairs["_size"] = 2
         records.append(pairs)
@@ -5644,7 +5742,9 @@ def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
         raw["NetRtg"] = raw["OffRtg"] - raw["DefRtg"]
         group = pd.DataFrame({"Season": raw["Season"], "Team": raw["Team"],
                               "TeamId": raw["TeamId"], "Minutes": raw["Minutes"],
-                              target_col: raw[target_col]})
+                              target_col: raw[target_col],
+            **({companion_col: raw[companion_col]}
+               if companion_col and companion_col in raw.columns else {})})
         for slot in range(size):
             group[f"P{slot + 1}"] = ids.map(lambda value: value[slot])
         group["_size"] = size
@@ -5751,6 +5851,18 @@ def build_subunit_training(_data, _lineup_data, _zfeat, _pools, base_cols,
         raw_outcome *= -1
     # The real rating, not one shrunk toward zero (see the five-man path).
     profile["_target"] = raw_outcome
+    if companion_col and companion_col in source.columns:
+        companion_values = source[companion_col].to_numpy(float)
+        companion_base = source["Season"].astype(str).map(companion_baseline)
+        if companion_base.isna().any():
+            fallback = {
+                str(season): float(np.average(
+                    rows[companion_col].to_numpy(float),
+                    weights=rows["Minutes"].to_numpy(float)))
+                for season, rows in source.groupby("Season")
+            }
+            companion_base = companion_base.fillna(source["Season"].astype(str).map(fallback))
+        profile["_companion"] = companion_values - companion_base.to_numpy(float)
     subunit_weights = np.minimum(
         source["Minutes"].to_numpy(float), LINEUP_WEIGHT_CAP
     )

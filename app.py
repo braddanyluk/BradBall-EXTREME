@@ -2935,6 +2935,30 @@ def render_team_builder(df, player_labels, player_options):
                  "historical cores.",
         )
 
+        if split_parts is not None:
+            st.markdown("#### Offense and defense")
+            split_rows = [(
+                "Skills and fit (the model)",
+                split_parts["net"], split_parts["offense"], split_parts["defense"],
+            )]
+            if use_pair_layer and abs(split_parts["other"]) >= 0.005:
+                split_rows.append((
+                    "Pair chemistry (not split)", split_parts["other"], np.nan, np.nan,
+                ))
+            st.dataframe(
+                pd.DataFrame(split_rows, columns=["Part", "Net", "Offense", "Defense"])
+                .style.format({"Net": "{:+.2f}", "Offense": "{:+.2f}", "Defense": "{:+.2f}"}, na_rep="—"),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "Offense is fit with exactly the same settings as net, and "
+                "defense is net minus offense, so the three always add up. "
+                "Defense inherits the errors of both models, so treat it as "
+                "the less certain half. Pair chemistry is a net-only "
+                "adjustment and isn't split."
+            )
+
         if error_split is not None and not capped_by_history:
             luck_sd = float(np.sqrt(error_split["noise_coef"] / 500.0)) * basis_scale
             stretch_half = 1.28 * float(np.sqrt(total_spread ** 2 + luck_sd ** 2))
@@ -3080,110 +3104,86 @@ def render_team_builder(df, player_labels, player_options):
             names.append(f"{row['player_name']} {row['Season']}")
 
         if use_pair_layer and pair_table is not None:
-            st.markdown("#### Pair chemistry")
-            st.write(
-                "Ten pairs share the floor in a lineup. 'Skills predict' is "
-                "how well each pair's skills fit together, beyond how good "
-                "each player is on his own, scored by a model that never saw "
-                "that pair's own results. 'Real history' is how the pair "
-                "actually deviated from its parts, shown for context."
-            )
-            shown_pairs = pair_table.assign(
-                **{"Shared minutes": pair_table["Shared minutes"].round(0)}
-            )
-            st.dataframe(
-                shown_pairs.style.format({
-                    "Skills predict": "{:+.2f}",
-                    "Shared minutes": "{:.0f}",
-                    "Real history": "{:+.2f}",
-                    "Used": "{:+.2f}",
-                }, na_rep="—"),
-                use_container_width=True,
-                hide_index=True,
-            )
+            with st.expander("Pair chemistry (the 10 pairs)"):
+                st.write(
+                    "Ten pairs share the floor in a lineup. 'Skills predict' is "
+                    "how well each pair's skills fit together, beyond how good "
+                    "each player is on his own, scored by a model that never saw "
+                    "that pair's own results. 'Real history' is how the pair "
+                    "actually deviated from its parts, shown for context."
+                )
+                shown_pairs = pair_table.assign(
+                    **{"Shared minutes": pair_table["Shared minutes"].round(0)}
+                )
+                st.dataframe(
+                    shown_pairs.style.format({
+                        "Skills predict": "{:+.2f}",
+                        "Shared minutes": "{:.0f}",
+                        "Real history": "{:+.2f}",
+                        "Used": "{:+.2f}",
+                    }, na_rep="—"),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            best_pair = pair_table.loc[pair_table["Used"].idxmax()]
-            worst_pair = pair_table.loc[pair_table["Used"].idxmin()]
-            st.caption(
-                f"Best fit: {best_pair['Pair']} ({best_pair['Used']:+.2f}). "
-                f"Worst fit: {worst_pair['Pair']} ({worst_pair['Used']:+.2f}). "
-                f"Total chemistry across the 10 pairs: "
-                f"{pair_table['Used'].sum():+.2f}, scaled by "
-                f"{pair_layer['backtest']['lam']:.2f} to {synergy_effect:+.2f} "
-                "per 100 in the prediction. "
-                + ("Each pair's real history was blended in."
-                   if blend_history else
-                   "Real history is shown but not used.")
-            )
+                best_pair = pair_table.loc[pair_table["Used"].idxmax()]
+                worst_pair = pair_table.loc[pair_table["Used"].idxmin()]
+                st.caption(
+                    f"Best fit: {best_pair['Pair']} ({best_pair['Used']:+.2f}). "
+                    f"Worst fit: {worst_pair['Pair']} ({worst_pair['Used']:+.2f}). "
+                    f"Total chemistry across the 10 pairs: "
+                    f"{pair_table['Used'].sum():+.2f}, scaled by "
+                    f"{pair_layer['backtest']['lam']:.2f} to {synergy_effect:+.2f} "
+                    "per 100 in the prediction. "
+                    + ("Each pair's real history was blended in."
+                       if blend_history else
+                       "Real history is shown but not used.")
+                )
 
         if lineup_data is not None:
             hist_column, hist_sign = LINEUP_TARGET_COLUMNS[target_label]
             same_five = lineup_history(
                 lineup_data, [df.loc[r, "player_id"] for r in selected_rows]
             )
-            st.markdown("#### Has this exact five played together?")
-            if same_five.empty:
-                st.caption(
-                    "Not in the lineup data. These five never shared the "
-                    "floor (or only did so outside the downloaded top "
-                    "players), so the estimate rests on skills alone."
-                )
-            else:
-                minutes_together = float(same_five["Minutes"].sum())
-                observed = float(
-                    hist_sign * (same_five[hist_column] * same_five["Minutes"]).sum()
-                    / minutes_together
-                )
-                trust_history = minutes_together / (minutes_together + LINEUP_SHRINK_MINUTES)
-                blended_history = trust_history * observed + (1 - trust_history) * prediction
-                h1, h2, h3 = st.columns(3)
-                h1.metric("What actually happened", f"{observed:+.1f}",
-                          help="Minutes-weighted, relative to a league-average team.")
-                h2.metric("Minutes together", f"{minutes_together:,.0f}")
-                h3.metric("Estimate if history were blended in", f"{blended_history:+.1f}",
-                          help="For comparison only. It is not part of the "
-                               "prediction above, which doesn't use this "
-                               "lineup's own results. Leans on history more "
-                               "as minutes grow.")
-                st.dataframe(
-                    same_five[["Season", "Team", "Minutes", "Sample", "NetRtg", "OffRtg", "DefRtg"]]
-                    .rename(columns={"NetRtg": "Net", "OffRtg": "Off", "DefRtg": "Def"})
-                    .style.format({"Minutes": "{:.0f}", "Net": "{:+.1f}",
-                                   "Off": "{:.1f}", "Def": "{:.1f}"}, na_rep="—"),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.caption(
-                    "Five-man results are noisy, so the blend trusts them "
-                    "slowly. "
-                    + ("The model was trained on lineups like this one, so "
-                       "agreement here isn't an independent test."
-                       if use_lineups else "")
-                )
-
-        if split_parts is not None:
-            st.markdown("#### Offense and defense")
-            split_rows = [(
-                "Skills and fit (the model)",
-                split_parts["net"], split_parts["offense"], split_parts["defense"],
-            )]
-            if use_pair_layer and abs(split_parts["other"]) >= 0.005:
-                split_rows.append((
-                    "Pair chemistry (not split)", split_parts["other"], np.nan, np.nan,
-                ))
-            st.dataframe(
-                pd.DataFrame(split_rows, columns=["Part", "Net", "Offense", "Defense"])
-                .style.format({"Net": "{:+.2f}", "Offense": "{:+.2f}", "Defense": "{:+.2f}"}, na_rep="—"),
-                use_container_width=True,
-                hide_index=True,
-            )
-            st.caption(
-                "Offense is fit with exactly the same settings as net, and "
-                "defense is net minus offense, so the three always add up. "
-                "Defense inherits the errors of both models, so treat it as "
-                "the less certain half. Pair chemistry is a net-only "
-                "adjustment and isn't split."
-            )
+            with st.expander("Has this exact five played together?"):
+                if same_five.empty:
+                    st.caption(
+                        "Not in the lineup data. These five never shared the "
+                        "floor (or only did so outside the downloaded top "
+                        "players), so the estimate rests on skills alone."
+                    )
+                else:
+                    minutes_together = float(same_five["Minutes"].sum())
+                    observed = float(
+                        hist_sign * (same_five[hist_column] * same_five["Minutes"]).sum()
+                        / minutes_together
+                    )
+                    trust_history = minutes_together / (minutes_together + LINEUP_SHRINK_MINUTES)
+                    blended_history = trust_history * observed + (1 - trust_history) * prediction
+                    h1, h2, h3 = st.columns(3)
+                    h1.metric("What actually happened", f"{observed:+.1f}",
+                              help="Minutes-weighted, relative to a league-average team.")
+                    h2.metric("Minutes together", f"{minutes_together:,.0f}")
+                    h3.metric("Estimate if history were blended in", f"{blended_history:+.1f}",
+                              help="For comparison only. It is not part of the "
+                                   "prediction above, which doesn't use this "
+                                   "lineup's own results. Leans on history more "
+                                   "as minutes grow.")
+                    st.dataframe(
+                        same_five[["Season", "Team", "Minutes", "Sample", "NetRtg", "OffRtg", "DefRtg"]]
+                        .rename(columns={"NetRtg": "Net", "OffRtg": "Off", "DefRtg": "Def"})
+                        .style.format({"Minutes": "{:.0f}", "Net": "{:+.1f}",
+                                       "Off": "{:.1f}", "Def": "{:.1f}"}, na_rep="—"),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "Five-man results are noisy, so the blend trusts them "
+                        "slowly. "
+                        + ("The model was trained on lineups like this one, so "
+                           "agreement here isn't an independent test."
+                           if use_lineups else "")
+                    )
 
         # ---- How this number was built ----
         def model_for(key, vector, pair_values=None):
@@ -3262,7 +3262,8 @@ def render_team_builder(df, player_labels, player_options):
             use_container_width=True,
             hide_index=True,
         )
-        st.bar_chart(steps.set_index("Step")["Effect"], use_container_width=True)
+        with st.expander("Chart of these steps"):
+            st.bar_chart(steps.set_index("Step")["Effect"], use_container_width=True)
         st.caption(
             f"Starts at a league-average team (0) and ends at the "
             f"prediction ({prediction:+.2f})."
@@ -3293,42 +3294,42 @@ def render_team_builder(df, player_labels, player_options):
             "Player": names,
             "Contribution (skills only)": player_effects,
         }).sort_values("Contribution (skills only)", ascending=False)
-        st.markdown("#### Each player's contribution")
-        st.dataframe(
-            contribution_table.style.format({"Contribution (skills only)": "{:+.2f}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.caption(
-            "How much each player adds compared with swapping in a "
-            "league-average player and leaving the other four alone. These "
-            "won't add up exactly to the total, because skills interact and "
-            "the five share the same shots and rebounds. Pair chemistry is "
-            "shown separately."
-        )
+        with st.expander("Each player's contribution"):
+            st.dataframe(
+                contribution_table.style.format({"Contribution (skills only)": "{:+.2f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption(
+                "How much each player adds compared with swapping in a "
+                "league-average player and leaving the other four alone. These "
+                "won't add up exactly to the total, because skills interact and "
+                "the five share the same shots and rebounds. Pair chemistry is "
+                "shown separately."
+            )
 
-        st.markdown("#### What drives this prediction")
+        with st.expander("What drives this prediction"):
 
-        top_drivers = contributions.reindex(
-            contributions.abs().sort_values(ascending=False).index
-        ).head(10)
-        driver_table = pd.DataFrame({
-            "Factor": top_drivers.index,
-            "Effect (pts/100)": top_drivers.values.round(2),
-            "Type": [
-                "Pair data" if f.startswith("Pair chemistry")
-                else "Interaction" if ("×" in f or "squared" in f)
-                else "Skill"
-                for f in top_drivers.index
-            ],
-        })
-        st.dataframe(driver_table, use_container_width=True, hide_index=True)
+            top_drivers = contributions.reindex(
+                contributions.abs().sort_values(ascending=False).index
+            ).head(10)
+            driver_table = pd.DataFrame({
+                "Factor": top_drivers.index,
+                "Effect (pts/100)": top_drivers.values.round(2),
+                "Type": [
+                    "Pair data" if f.startswith("Pair chemistry")
+                    else "Interaction" if ("×" in f or "squared" in f)
+                    else "Skill"
+                    for f in top_drivers.index
+                ],
+            })
+            st.dataframe(driver_table, use_container_width=True, hide_index=True)
 
-        st.caption(
-            "Positive effects raise the prediction. Rows marked "
-            "'Interaction' are stacking terms: they exist only when skills "
-            "combine."
-        )
+            st.caption(
+                "Positive effects raise the prediction. Rows marked "
+                "'Interaction' are stacking terms: they exist only when skills "
+                "combine."
+            )
 
         with st.expander(
             "Lineup profile (z-scores vs. each player's season, after "
